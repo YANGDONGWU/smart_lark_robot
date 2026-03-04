@@ -1,7 +1,7 @@
 name: Feishu AI Bot 24h
 on:
   schedule:
-    - cron: '0 */6 * * *'  # 每 6 小时自动启动新实例
+    - cron: '0 */5 * * *'  # 每 6 小时自动启动新实例
   workflow_dispatch:       # 允许手动启动
 
 jobs:
