@@ -41,38 +41,83 @@ def redis_call(command, key, value=None):
 
 # --- 3. 工具模块 ---
 def recognize_image_text(image_key, message_id):
-    """自测点：必须携带 message_id 下载资源，否则 403"""
+    """
+    修正版 OCR：解决 GetMessageResourceResponse 属性引用问题
+    """
     try:
-        image_resp = lark_client.im.v1.message_resource.get() \
+        # 1. 构造下载请求
+        request = GetMessageResourceRequest.builder() \
             .message_id(message_id) \
             .file_key(image_key) \
             .type("image") \
             .build()
 
-        # 兼容性处理：读取二进制流
-        img_data = image_resp.file.read()
-        request = BasicRecognizeImageRequest.builder() \
+        # 2. 执行下载
+        response = lark_client.im.v1.message_resource.get(request)
+
+        # 3. 检查下载是否成功
+        if not response.success():
+            return f"[下载图片失败: {response.msg}]"
+
+        # 4. 获取二进制流 (核心修正点：直接从 response.file 读取)
+        img_binary = response.file.read()
+        if not img_binary:
+            return "[图片内容为空]"
+
+        img_base64 = base64.b64encode(img_binary).decode('utf-8')
+
+        # 5. 调用 OCR 识别
+        ocr_req = BasicRecognizeImageRequest.builder() \
             .request_body(BasicRecognizeImageRequestBody.builder()
-                          .image(base64.b64encode(img_data).decode('utf-8'))
+                          .image(img_base64)
                           .build()) \
             .build()
 
-        response = lark_client.optical_character_recognition.v1.image.basic_recognize(request)
-        return "\n".join(response.data.text_list) if response.success() else "[OCR 失败]"
+        ocr_resp = lark_client.optical_char_recognition.v1.image.basic_recognize(ocr_req)
+
+        if ocr_resp.success():
+            text_list = ocr_resp.data.text_list
+            return "\n".join(text_list) if text_list else "[图片中未检测到文字]"
+        else:
+            return f"[OCR 识别失败: {ocr_resp.msg}]"
+
     except Exception as e:
-        return f"[OCR 异常: {str(e)}]"
+        # 打印详细错误到控制台方便你调试
+        print(f"OCR Debug Error: {e}")
+        return f"[OCR 模块异常: {str(e)}]"
 
 
 def manage_task(command_type, data):
-    """自测点：修正 Task V2 模型对象名称"""
+    """修正版：具备时间清洗功能的任务管理"""
     try:
         if command_type == "CREATE":
-            summary, t_str = data.split("|")
-            # 处理时间戳
-            today = datetime.now().strftime("%Y-%m-%d")
-            ts = int(time.mktime(time.strptime(f"{today} {t_str}", "%Y-%m-%d %H:%M"))) * 1000
+            # 预期 data 格式为 "内容|时间"
+            if "|" not in data: return "❌ 格式错误：缺少分隔符"
 
-            # 使用 Due 模型而非 TaskDue
+            summary, t_str = data.split("|")
+
+            # --- 时间清洗逻辑：只保留 HH:mm 部分 ---
+            # 使用正则匹配字符串中的数字，提取类似 14:00 的部分
+            time_match = re.search(r"(\d{1,2}:\d{2})", t_str)
+            if not time_match:
+                return f"❌ 无法解析时间: {t_str}"
+
+            clean_time = time_match.group(1) # 得到 "14:00"
+
+            # --- 日期推断逻辑 ---
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+
+            # 尝试构造完整时间字符串
+            final_dt_str = f"{today_str} {clean_time}"
+
+            # 转化为毫秒时间戳
+            ts = int(time.mktime(time.strptime(final_dt_str, "%Y-%m-%d %H:%M"))) * 1000
+
+            # 如果解析出的时间已经过去了（比如现在15点，设14点），自动补到明天
+            if ts < time.time() * 1000:
+                ts += 24 * 3600 * 1000
+
             due_obj = Due.builder().time(str(ts)).timezone("Asia/Shanghai").build()
             task_obj = Task.builder().summary(f"⏰ 提醒：{summary}").due(due_obj).build()
 
@@ -80,6 +125,7 @@ def manage_task(command_type, data):
             resp = lark_client.task.v2.task.create(req)
             return "✅ 已同步至飞书待办" if resp.success() else f"❌ 创建失败: {resp.msg}"
 
+        # DELETE 逻辑保持不变...
         elif command_type == "DELETE":
             list_resp = lark_client.task.v2.task.list(ListTaskRequest.builder().completed(False).build())
             if list_resp.success() and list_resp.data.items:
@@ -118,7 +164,10 @@ def get_ai_answer(chat_id, query, img_text=""):
     history = json.loads(hist_raw) if hist_raw else []
 
     system_prompt = f"你是飞书全能助手杨艾伦。当前北京时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}。\n" \
-                    "指令格式：创建(>>>TASK_CREATE:内容|HH:mm<<<), 取消(>>>TASK_DELETE:关键词<<<)。"
+                    "【指令准则】：\n" \
+                    "1. 创建任务必须严格使用格式：>>>TASK_CREATE:内容|HH:mm<<< \n" \
+                    "2. 严禁在 HH:mm 中包含'明天'、'下午'等中文字符，请根据当前时间自行换算为24小时制数字。\n" \
+                    "3. 如果用户说'明天14点'，你只需输出 14:00，脚本会自动处理日期。"
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history[-10:])
@@ -151,9 +200,20 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
         content_json = json.loads(msg_obj.content)
         if msg_type == "text":
             query = content_json.get("text", "").strip()
+        # elif msg_type == "image":
+        #     img_txt = recognize_image_text(content_json.get("image_key"), msg_id)
+        #     query = "识别图中文字并分析"
         elif msg_type == "image":
-            img_txt = recognize_image_text(content_json.get("image_key"), msg_id)
-            query = "识别图中文字并分析"
+            try:
+                content_json = json.loads(msg_obj.content)
+                image_key = content_json.get("image_key")
+                # 务必传入 message_id
+                img_txt = recognize_image_text(image_key, msg_id)
+
+                # 这里的 query 不能是空的，否则 AI 不会思考
+                query = f"这是我发送的图片内容识别结果：\n{img_txt}\n请根据以上内容进行分析。"
+            except Exception as e:
+                query = f"识别图片时发生错误: {str(e)}"
     except:
         return
 
@@ -177,7 +237,7 @@ def handle_message(data: P2ImMessageReceiveV1) -> None:
         elements.extend([{"tag": "hr"}, {"tag": "note", "elements": [{"tag": "lark_md", "content": notice}]}])
 
     card = {
-        "header": {"title": {"tag": "plain_text", "content": "杨艾伦 Pro | 已自测"}, "template": "indigo"},
+        "header": {"title": {"tag": "plain_text", "content": "Allen Agent"}, "template": "indigo"},
         "elements": elements
     }
 
@@ -193,8 +253,19 @@ event_handler = EventDispatcherHandler.builder("", "").register_p2_im_message_re
 
 
 def main():
-    print(f"[{datetime.now()}] 🚀 杨艾伦自测版启动成功，正在监听 WebSocket...")
-    WsClient(app_id=APP_ID, app_secret=APP_SECRET, event_handler=event_handler).start()
+    print(f"[{datetime.now()}] 🚀 Allen Agent | 正在建立稳健连接...")
+
+    # 建立客户端时可以指定日志级别
+    ws_client = WsClient(
+        app_id=APP_ID,
+        app_secret=APP_SECRET,
+        event_handler=event_handler,
+        log_level=lark.LogLevel.INFO  # 如果想看更细的连接细节，可以改用 DEBUG
+    )
+
+    # 这种启动方式会自动处理重连
+    # 即使出现 keepalive ping timeout，SDK 也会在 3-5 秒内自动找回连接
+    ws_client.start()
 
 
 if __name__ == "__main__":
