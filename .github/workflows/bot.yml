@@ -1,23 +1,37 @@
-name: Feishu AI Bot 24h
+name: Feishu AI Bot Auto Deploy
+
 on:
+  push:
+    branches:
+      - main  # 当你 git push 到 main 分支时自动触发部署
   schedule:
-    - cron: '0 */5 * * *'  # 每 6 小时自动启动新实例
-  workflow_dispatch:       # 允许手动启动
+    - cron: '0 */5 * * *' # 每 5 小时自动重跑一次（防止 GitHub Actions 超时停止）
+  workflow_dispatch:      # 允许你在 GitHub 页面上手动点击按钮部署
 
 jobs:
-  run-bot:
+  deploy:
     runs-on: ubuntu-latest
-    # 设置超市时间略低于 cron 频率，确保平滑切换
-    timeout-minutes: 350 
+    # 如果上一个任务还在跑，直接杀掉它，保证只有一个机器人在线
+    concurrency:
+      group: feishu-bot
+      cancel-in-progress: true
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install dependencies
-        run: pip install lark-oapi openai tavily-python
-      - name: Run AI Assistant
+          cache: 'pip' # 自动缓存依赖，加快部署速度
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install lark-oapi==1.5.3 openai tavily-python
+
+      - name: Run Bot
         env:
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
