@@ -24,11 +24,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip' # 自动缓存依赖，加快部署速度
 
       - name: Install Dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install lark-oapi==1.5.3 openai tavily-python
 
       - name: Run Bot
