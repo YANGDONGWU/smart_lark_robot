@@ -22,10 +22,16 @@ executor = ThreadPoolExecutor(max_workers=5)
 
 # --- 2. 稳健版 Redis 存储 ---
 def redis_call(command, key, value=None, ex=2592000):
+    # 检查环境变量是否存在
+    if not REDIS_TOKEN or not REDIS_URL:
+        print("❌ 错误：REDIS_TOKEN 或 REDIS_URL 未设置")
+        return None
+
     headers = {"Authorization": f"Bearer {REDIS_TOKEN}"}
     try:
         if command == "set":
             url = f"{REDIS_URL}/set/{key}?ex={ex}"
+            # 【重要修正】Upstash SET 命令如果是存字符串，需要确保是正确的 JSON 格式
             res = requests.post(url, headers=headers, data=json.dumps(value), timeout=5)
         elif command == "keys":
             url = f"{REDIS_URL}/keys/{key}"
@@ -34,10 +40,14 @@ def redis_call(command, key, value=None, ex=2592000):
             url = f"{REDIS_URL}/{command}/{key}"
             res = requests.get(url, headers=headers, timeout=5)
 
-        result = res.json().get("result")
-        return result
+        # 打印响应状态码协助排查
+        if res.status_code != 200:
+            print(f"❌ Redis API 报错: 状态码 {res.status_code}, 内容 {res.text}")
+            return None
+
+        return res.json().get("result")
     except Exception as e:
-        print(f"❌ Redis 异常: {e}")
+        print(f"❌ Redis 请求异常: {e}")
         return None
 
 
