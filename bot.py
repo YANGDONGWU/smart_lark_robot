@@ -14,8 +14,8 @@ APP_ID = os.getenv("FEISHU_APP_ID")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
 TAVILY_KEY = os.getenv("TAVILY_KEY")
-REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
-REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+REDIS_URL = "https://hip-cougar-3988.upstash.io"
+REDIS_TOKEN = "AQ-UAAImcDJlMGE1MmE1MzVjNzU0NWU0YjUzN2I2MjliYjc1MWQwNnAyMzk4OA"
 
 ai_client = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
 tavily_client = TavilyClient(api_key=TAVILY_KEY)
