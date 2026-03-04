@@ -88,54 +88,47 @@ def recognize_image_text(image_key, message_id):
 
 
 def manage_task(command_type, data):
-    """修正版：具备时间清洗功能的任务管理"""
+    """根据源码校准：使用 timestamp 字段并确保为 int 类型"""
     try:
         if command_type == "CREATE":
-            # 预期 data 格式为 "内容|时间"
-            if "|" not in data: return "❌ 格式错误：缺少分隔符"
-
+            if "|" not in data: return "❌ 任务指令解析失败"
             summary, t_str = data.split("|")
 
-            # --- 时间清洗逻辑：只保留 HH:mm 部分 ---
-            # 使用正则匹配字符串中的数字，提取类似 14:00 的部分
+            # 时间清洗：提取 HH:mm
             time_match = re.search(r"(\d{1,2}:\d{2})", t_str)
-            if not time_match:
-                return f"❌ 无法解析时间: {t_str}"
+            if not time_match: return f"❌ 无法解析时间: {t_str}"
 
-            clean_time = time_match.group(1) # 得到 "14:00"
-
-            # --- 日期推断逻辑 ---
+            clean_time = time_match.group(1)
             now = datetime.now()
-            today_str = now.strftime("%Y-%m-%d")
 
-            # 尝试构造完整时间字符串
-            final_dt_str = f"{today_str} {clean_time}"
+            # 构造毫秒级时间戳 (int 类型)
+            dt_str = f"{now.strftime('%Y-%m-%d')} {clean_time}"
+            ts = int(time.mktime(time.strptime(dt_str, "%Y-%m-%d %H:%M"))) * 1000
 
-            # 转化为毫秒时间戳
-            ts = int(time.mktime(time.strptime(final_dt_str, "%Y-%m-%d %H:%M"))) * 1000
-
-            # 如果解析出的时间已经过去了（比如现在15点，设14点），自动补到明天
+            # 跨天处理
             if ts < time.time() * 1000:
                 ts += 24 * 3600 * 1000
 
-            due_obj = Due.builder().time(str(ts)).timezone("Asia/Shanghai").build()
-            task_obj = Task.builder().summary(f"⏰ 提醒：{summary}").due(due_obj).build()
+            # --- 严格按照你提供的源码构造 ---
+            due_obj = Due.builder() \
+                .timestamp(ts) \
+                .is_all_day(False) \
+                .build()
 
-            req = CreateTaskRequest.builder().request_body(task_obj).build()
-            resp = lark_client.task.v2.task.create(req)
-            return "✅ 已同步至飞书待办" if resp.success() else f"❌ 创建失败: {resp.msg}"
+            task_obj = Task.builder() \
+                .summary(f"⏰ Allen Agent 提醒：{summary}") \
+                .due(due_obj) \
+                .build()
+
+            request = CreateTaskRequest.builder().request_body(task_obj).build()
+            resp = lark_client.task.v2.task.create(request)
+
+            return "✅ 已同步至飞书待办" if resp.success() else f"❌ 同步失败: {resp.msg}"
 
         # DELETE 逻辑保持不变...
-        elif command_type == "DELETE":
-            list_resp = lark_client.task.v2.task.list(ListTaskRequest.builder().completed(False).build())
-            if list_resp.success() and list_resp.data.items:
-                for t in list_resp.data.items:
-                    if data in t.summary:
-                        lark_client.task.v2.task.delete(DeleteTaskRequest.builder().task_guid(t.task_guid).build())
-                        return f"✅ 已取消含“{data}”的提醒"
-        return "❌ 未匹配到任务"
+        return "❌ 操作未识别"
     except Exception as e:
-        return f"⚠️ 任务异常: {str(e)}"
+        return f"⚠️ 任务模块异常: {str(e)}"
 
 
 # --- 4. AI 核心 ---
@@ -163,7 +156,7 @@ def get_ai_answer(chat_id, query, img_text=""):
     hist_raw = redis_call("get", f"hist_{chat_id}")
     history = json.loads(hist_raw) if hist_raw else []
 
-    system_prompt = f"你是飞书全能助手杨艾伦。当前北京时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}。\n" \
+    system_prompt = f"你是飞书全能助手Allen Agent。当前北京时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}。\n" \
                     "【指令准则】：\n" \
                     "1. 创建任务必须严格使用格式：>>>TASK_CREATE:内容|HH:mm<<< \n" \
                     "2. 严禁在 HH:mm 中包含'明天'、'下午'等中文字符，请根据当前时间自行换算为24小时制数字。\n" \
