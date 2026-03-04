@@ -17,7 +17,7 @@ REDIS_TOKEN = "ARAfAAImcDI2N2I1NDdkMjBkYTE0OWM3YmNjYzg1YWNhMjUxOWE2YXAyNDEyNw"
 
 ai_client = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
 lark_client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
-executor = ThreadPoolExecutor(max_workers=8)  # 增加并发能力
+executor = ThreadPoolExecutor(max_workers=10)
 
 
 # --- 2. 核心工具函数 ---
@@ -40,26 +40,26 @@ def redis_call(command, key, value=None, ex=2592000):
 
 
 def search_tavily(query):
-    if not TAVILY_KEY: return "搜索未配置。"
+    if not TAVILY_KEY: return ""
     try:
         url = "https://api.tavily.com/search"
-        payload = {"api_key": TAVILY_KEY, "query": query, "search_depth": "smart", "include_answer": True}
-        res = requests.post(url, json=payload, timeout=15)
+        # 使用 advanced 深度搜索，确保拿到真实榜单数据
+        payload = {"api_key": TAVILY_KEY, "query": query, "search_depth": "advanced", "include_answer": True}
+        res = requests.post(url, json=payload, timeout=20)
         data = res.json()
-        return data.get("answer") or "\n".join([r['content'] for r in data.get("results", [])[:3]])
+        return data.get("answer") or "\n".join([r['content'] for r in data.get("results", [])[:5]])
     except Exception as e:
         print(f"🔍 搜索报错: {e}");
-        return "联网搜索超时。"
+        return ""
 
 
-# --- 3. 任务扫描器 (支持 ONCE/DAILY/WEEKLY/MONTHLY) ---
+# --- 3. 任务扫描与推送 ---
 
 def send_reminder_card(chat_id, content, tag="提醒"):
     card = {
         "header": {"title": {"tag": "plain_text", "content": f"⏰ {tag}"},
                    "template": "purple" if "周期" in tag else "blue"},
-        "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": f"**计划任务执行：**\n{content}"}},
-                     {"tag": "hr"}]
+        "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": f"**事项：**\n{content}"}}, {"tag": "hr"}]
     }
     request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(
         CreateMessageRequestBody.builder().receive_id(chat_id).content(json.dumps(card)).msg_type("interactive").build()
@@ -82,7 +82,7 @@ def task_scanner():
                             cid = k.split(":")[1]
                             send_reminder_card(cid, txt, tag=tag)
                             redis_call("del", k)
-                            # 自动续期
+                            # 自动续期逻辑
                             next_dt = None
                             if prefix == "daily":
                                 next_dt = now_bj + timedelta(days=1)
@@ -97,7 +97,7 @@ def task_scanner():
         time.sleep(15)
 
 
-# --- 4. 核心业务逻辑 (单次请求架构) ---
+# --- 4. 核心业务逻辑 (语义预判与单请求融合) ---
 
 def process_message_async(data: P2ImMessageReceiveV1):
     msg_obj = data.event.message
@@ -113,51 +113,52 @@ def process_message_async(data: P2ImMessageReceiveV1):
 
     now_bj = datetime.utcnow() + timedelta(hours=8)
 
-    # --- 步骤 1: 预检索 (仅拉取待办列表，不走AI判断) ---
+    # --- 步骤 1: 智能语义预判 (不再死记硬背关键词) ---
+    search_info = ""
+    # 正则识别：时间敏感词、事实询问词、数据趋势词
+    semantic_signals = r"今|昨|明|后|现在|最近|目前|本周|本月|排行|名单|谁|哪|多少|榜|比分|价格|汇率|放假|趋势|动态|前十"
+    if re.search(semantic_signals, query):
+        print(f"🧠 语义预判命中：执行深度搜索内容 -> {query}")
+        search_info = search_tavily(query)
+
+    # --- 步骤 2: 状态与上下文提取 ---
     current_reminders = ""
     remind_keys = []
     for p in ["remind", "daily", "weekly", "monthly"]:
         found = redis_call("keys", f"{p}:{chat_id}:*")
         if found: remind_keys.extend(found)
-    if remind_keys and any(k in query for k in ["提醒", "计划", "什么时候", "今天"]):
-        items = [f"• {k.split(':')[-1][8:12]} {redis_call('get', k)}" for k in sorted(remind_keys)[:5]]
+    if remind_keys and any(re.search(r"提醒|计划|待办|安排|什么时候", query) for _ in [0]):
+        items = [f"• {k.split(':')[-1][8:12]} {redis_call('get', k)}" for k in sorted(remind_keys)[:8]]
         current_reminders = "\n".join(items)
 
-    # --- 步骤 2: 联网评估 (不再调用第二次 DeepSeek) ---
-    # 我们根据 query 特征简单判断是否需要搜索，节省一次 AI 调用
-    search_info = ""
-    if any(k in query for k in ["榜单", "排行", "最新", "天气", "新闻", "多少钱", "怎么放假"]):
-        search_info = search_tavily(query)
-
-    # --- 步骤 3: 构造并发送终极请求 ---
     hist_raw = redis_call("get", f"hist_{chat_id}")
     history = json.loads(hist_raw) if hist_raw else []
 
-    sys_prompt = f"""你是智能助理 Allen Agent。北京时间: {now_bj.strftime('%Y-%m-%d %H:%M')}。
+    # --- 步骤 3: 构造强约束系统 Prompt ---
+    sys_prompt = f"""你是 Allen Agent。北京时间: {now_bj.strftime('%Y-%m-%d %H:%M')}。
 
-    [能力说明]
-    1. 你可以设定各种周期的提醒。
-    2. 你知道当前的放假调休情况（见参考信息）。
+    [强制规则]
+    1. 你必须基于[实时参考]的数据回答。严禁回答“我无法获取”或“建议你自己去查”。
+    2. 如果参考信息包含榜单或数据，请清晰地罗列出来。
+    3. 若涉及节假日，请根据参考信息中的调休安排给出准确日期。
 
-    [待办列表]
-    {current_reminders if current_reminders else "暂无待办事项。"}
+    [当前状态]
+    待办列表: {current_reminders if current_reminders else "空"}
+    实时参考: {search_info if search_info else "当前为常识讨论，无需外部数据。"}
 
-    [实时参考]
-    {search_info if search_info else "无需外部搜索。"}
-
-    [输出规范]
-    若要设定提醒，必须在回复末尾添加指令：@@@TASK_模式:内容|HH:mm@@@
-    模式选一：ONCE, DAILY, WEEKLY, MONTHLY。
+    [指令规范]
+    设定提醒必带：@@@TASK_模式:内容|HH:mm@@@ (模式: ONCE, DAILY, WEEKLY, MONTHLY)
     """
 
+    # --- 步骤 4: 执行单次 AI 请求 ---
     messages = [{"role": "system", "content": sys_prompt}]
-    messages.extend(history[-16:])  # 保留 8 轮对话
+    messages.extend(history[-12:])  # 保持 6 轮记忆
     messages.append({"role": "user", "content": query})
 
     res = ai_client.chat.completions.create(model="deepseek-chat", messages=messages, temperature=0.3)
     ans = res.choices[0].message.content
 
-    # --- 步骤 4: 指令解析与状态更新 ---
+    # --- 步骤 5: 结果解析与推送 ---
     notice_md = ""
     for cmd, prefix in [("ONCE", "remind"), ("DAILY", "daily"), ("WEEKLY", "weekly"), ("MONTHLY", "monthly")]:
         match = re.search(rf"@@@TASK_{cmd}:(.*?)@@@", ans)
@@ -169,12 +170,11 @@ def process_message_async(data: P2ImMessageReceiveV1):
                 if target_dt < now_bj: target_dt += timedelta(days=1)
 
                 redis_call("set", f"{prefix}:{chat_id}:{target_dt.strftime('%Y%m%d%H%M')}", content)
-                notice_md = f"✅ 已成功录入{cmd}提醒：{content} ({target_dt.strftime('%H:%M')})"
+                notice_md = f"✅ 已存入{cmd}任务：{content} ({target_dt.strftime('%H:%M')})"
                 ans = re.sub(rf"@@@TASK_{cmd}:(.*?)@@@", "", ans).strip()
             except:
                 pass
 
-    # --- 步骤 5: 飞书推送 ---
     elements = [{"tag": "div", "text": {"tag": "lark_md", "content": ans}}]
     if notice_md: elements.extend(
         [{"tag": "hr"}, {"tag": "note", "elements": [{"tag": "lark_md", "content": notice_md}]}])
@@ -185,18 +185,18 @@ def process_message_async(data: P2ImMessageReceiveV1):
             "interactive").build()
     ).build())
 
-    # --- 步骤 6: 记忆存储 ---
-    history.append({"role": "user", "content": query});
+    # --- 步骤 6: 记忆持久化 ---
+    history.append({"role": "user", "content": query})
     history.append({"role": "assistant", "content": ans})
     redis_call("set", f"hist_{chat_id}", history[-20:], ex=7200)
 
 
-# --- 5. 启动程序 ---
+# --- 5. 启动 ---
 def main():
     threading.Thread(target=task_scanner, daemon=True).start()
     handler = EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(
         lambda d: executor.submit(process_message_async, d)).build()
-    print("🚀 Allen Agent 3.0 (High Performance) 已就绪")
+    print("🚀 Allen Agent 3.1 (Semantic Engine) 启动成功")
     WsClient(app_id=APP_ID, app_secret=APP_SECRET, event_handler=handler).start()
 
 
