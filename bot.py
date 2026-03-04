@@ -126,22 +126,38 @@ def process_message_async(data: P2ImMessageReceiveV1):
 
     # 提示 AI 显式使用 HH:mm 格式
     now_bj = datetime.utcnow() + timedelta(hours=8)
-    prompt = f"你是助手Allen Agent。现在北京时间{now_bj.strftime('%Y-%m-%d %H:%M')}。\n" \
-             "设定提醒请严格输出指令（不要包含中文单位）：\n" \
-             ">>>TASK_ONCE:事项|HH:mm<<< 或 >>>TASK_DAILY:事项|HH:mm<<<"
 
-    res = ai_client.chat.completions.create(model="deepseek-chat", messages=[{"role": "system", "content": prompt},
-                                                                             {"role": "user", "content": query}],
-                                            temperature=0.1)
+    # 【核心优化 1】极其严厉的 Prompt
+    prompt = f"""你是助手Allen Agent。现在北京时间{now_bj.strftime('%Y-%m-%d %H:%M')}。
+        你的任务是帮助用户设定提醒。
+
+        规则：
+        1. 如果用户要求设定提醒，你必须在回答的【最后一行】精准附带指令。
+        2. 一次性指令格式：@@@TASK_ONCE:事项|HH:mm@@@
+        3. 每日指令格式：@@@TASK_DAILY:事项|HH:mm@@@
+        4. 不要缩写事项，不要更改 @@@ 符号。
+
+        示例回复：
+        好的，没问题。
+        @@@TASK_ONCE:睡觉|23:43@@@
+        """
+
+    res = ai_client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "system", "content": prompt}, {"role": "user", "content": query}],
+        temperature=0.1
+    )
     ans = res.choices[0].message.content
 
+    # 【核心优化 2】改进正则匹配 (换成更独特的 @@@ 符号避免冲突)
     notice_md = ""
-    for pattern, prefix in [(r">>>TASK_ONCE:(.*?)<<<", "remind"), (r">>>TASK_DAILY:(.*?)<<<", "daily")]:
+    # 注意这里正则改成了 @@@
+    for pattern, prefix in [(r"@@@TASK_ONCE:(.*?)@@@", "remind"), (r"@@@TASK_DAILY:(.*?)@@@", "daily")]:
         match = re.search(pattern, ans)
         if match:
             try:
-                content, raw_time = match.group(1).split("|")
-                # 正则清洗：只取数字部分 22:43
+                raw_data = match.group(1)
+                content, raw_time = raw_data.split("|")
                 time_match = re.search(r"(\d{1,2}:\d{2})", raw_time)
                 if not time_match: continue
                 time_clean = time_match.group(1)
@@ -150,12 +166,16 @@ def process_message_async(data: P2ImMessageReceiveV1):
                 if target_dt < now_bj: target_dt += timedelta(days=1)
 
                 slot = target_dt.strftime("%Y%m%d%H%M")
-                redis_call("set", f"{prefix}:{chat_id}:{slot}", content)
+
+                # 存入 Redis 并打印日志以便在 GitHub Actions 观察
+                success = redis_call("set", f"{prefix}:{chat_id}:{slot}", content)
+                print(f"DEBUG: 写入Redis {'成功' if success else '失败'} | Key: {prefix}:{chat_id}:{slot}")
 
                 notice_md = f"✅ 已为您预约北京时间 {target_dt.strftime('%H:%M')} 提醒：{content}"
-                ans = ans.replace(match.group(0), "").strip()
+                # 隐藏掉回复中的原始指令串，保持美观
+                ans = re.sub(pattern, "", ans).strip()
             except Exception as e:
-                print(f"解析指令失败: {e}")
+                print(f"❌ 解析指令异常: {e}")
 
     # 回复用户
     elements = [{"tag": "div", "text": {"tag": "lark_md", "content": ans}}]
