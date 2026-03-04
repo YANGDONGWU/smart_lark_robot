@@ -12,7 +12,7 @@ APP_ID = os.getenv("FEISHU_APP_ID")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
 REDIS_URL = "https://together-reindeer-4127.upstash.io"
-REDIS_TOKEN = "ARAfAAImcDI2N2I1NDdkMjBkYTE0OWM3YmNjYzg1YWNhMjUxOWE2YXAyNDEyNw"
+REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
 # 客户端初始化
 ai_client = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
@@ -46,7 +46,7 @@ def redis_call(command, key, value=None, ex=2592000):
 # --- 3. 定时任务执行模块 (主动推送) ---
 def send_reminder_card(chat_id, content, is_daily=False):
     """
-    当时间到达时，机器人主动在私聊中推送卡片
+    修正版：解决 CreateMessageRequestBuilder 属性引用错误
     """
     title = "🔄 每日循环提醒" if is_daily else "⏰ 一次性定时提醒"
     color = "purple" if is_daily else "blue"
@@ -60,54 +60,60 @@ def send_reminder_card(chat_id, content, is_daily=False):
         ]
     }
 
+    # --- 核心修正点：使用 request_body 构造 ---
     request = CreateMessageRequest.builder() \
         .receive_id_type("chat_id") \
-        .receive_id(chat_id) \
-        .content(json.dumps(card)) \
-        .msg_type("interactive") \
+        .request_body(CreateMessageRequestBody.builder()
+            .receive_id(chat_id)  # ID 放在 request_body 里
+            .content(json.dumps(card))
+            .msg_type("interactive")
+            .build()) \
         .build()
-    lark_client.im.v1.message.create(request)
+
+    response = lark_client.im.v1.message.create(request)
+
+    if not response.success():
+        print(f"❌ 提醒推送失败: {response.msg}")
+    else:
+        print(f"✅ 提醒推送成功: {content}")
 
 
 # --- 4. 任务扫描线程 (核心：支持每日续期) ---
 def task_scanner():
-    """
-    后台线程：每 30 秒扫描一次 Redis，寻找匹配当前分钟的任务
-    """
-    print(f"[{datetime.now()}] ⏰ 任务扫描器已启动...")
+    print(f"[{datetime.now()}] ⏰ 强化版任务扫描器已启动...")
     while True:
         try:
-            now = datetime.now()
-            slot = now.strftime("%Y%m%d%H%M")  # 格式：202603041430
+            # 强制使用北京时间 (UTC+8)
+            # 如果没装 pytz，可以用 timedelta 手动计算
+            now_utc = datetime.utcnow()
+            now = now_utc + timedelta(hours=8)
 
-            # 1. 处理一次性提醒 (remind:chat_id:slot)
-            r_keys = redis_call("scan", f"remind:*:{slot}")
-            if r_keys:
-                for k in r_keys:
-                    parts = k.split(":")
-                    if len(parts) < 3: continue
-                    cid, txt = parts[1], redis_call("get", k)
-                    if txt:
-                        send_reminder_card(cid, txt, is_daily=False)
-                        redis_call("del", k)  # 发完即删
+            slot = now.strftime("%Y%m%d%H%M")
+            # 增加一行打印，每分钟看一眼，确认扫描器时间是否正确
+            if now.second % 30 == 0:
+                print(f"DEBUG: 扫描器当前检查槽位: {slot}")
 
-            # 2. 处理每日提醒 (daily:chat_id:slot)
-            d_keys = redis_call("scan", f"daily:*:{slot}")
-            if d_keys:
-                for dk in d_keys:
-                    parts = dk.split(":")
-                    if len(parts) < 3: continue
-                    cid, txt = parts[1], redis_call("get", dk)
-                    if txt:
-                        send_reminder_card(cid, txt, is_daily=True)
-                        # --- 优雅改进：自动预约明天同一时间，并刷新30天过期时间 ---
-                        next_day_slot = (now + timedelta(days=1)).strftime("%Y%m%d%H%M")
-                        redis_call("set", f"daily:{cid}:{next_day_slot}", txt, ex=2592000)
-                        redis_call("del", dk)
-                        print(f"♻️ 每日任务续期成功: {txt} -> {next_day_slot}")
+            # 扫描当前槽位
+            for prefix in ["remind", "daily"]:
+                pattern = f"{prefix}:*:{slot}"
+                keys = redis_call("scan", pattern)
+                if keys:
+                    for k in keys:
+                        txt = redis_call("get", k)
+                        if txt:
+                            # 提取 chat_id 或 open_id
+                            cid = k.split(":")[1]
+                            print(f"🔔 触发提醒: {txt} -> {cid}")
+                            send_reminder_card(cid, txt, is_daily=(prefix == "daily"))
+                            redis_call("del", k)
+                            # 如果是每日任务，续期
+                            if prefix == "daily":
+                                next_slot = (now + timedelta(days=1)).strftime("%Y%m%d%H%M")
+                                redis_call("set", f"daily:{cid}:{next_slot}", txt)
+
         except Exception as e:
-            print(f"扫描器运行错误: {e}")
-        time.sleep(30)
+            print(f"❌ 扫描器报错: {e}")
+        time.sleep(10)
 
 
 # --- 5. 消息处理与 AI 逻辑 ---
