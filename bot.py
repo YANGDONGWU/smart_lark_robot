@@ -12,7 +12,7 @@ APP_ID = os.getenv("FEISHU_APP_ID")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
 REDIS_URL = "https://together-reindeer-4127.upstash.io"
-REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+REDIS_TOKEN = os.getenv("FEISHU_REDIS_TOKEN")
 
 # 客户端初始化
 ai_client = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
@@ -24,7 +24,7 @@ executor = ThreadPoolExecutor(max_workers=5)
 def redis_call(command, key, value=None, ex=2592000):
     # 检查环境变量是否存在
     if not REDIS_TOKEN or not REDIS_URL:
-        print("❌ 错误：REDIS_TOKEN 或 REDIS_URL 未设置")
+        print("❌ 错误：REDIS_TOKEN 或 REDIS_URL 未设置!")
         return None
 
     headers = {"Authorization": f"Bearer {REDIS_TOKEN}"}
