@@ -53,11 +53,12 @@ def redis_call(command, key, value=None, ex=2592000):
 
 # --- 3. 消息推送 (修正 Builder 属性问题) ---
 def send_reminder_card(chat_id, content, is_daily=False):
+    clean_content = content.encode('utf-8').decode('unicode_escape') if '\\u' in content else content
     title = "🔄 每日循环提醒" if is_daily else "⏰ 一次性定时提醒"
     card = {
         "header": {"title": {"tag": "plain_text", "content": title}, "template": "purple" if is_daily else "blue"},
         "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": f"**提醒时间到！**\n📌 事项：{content}"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"**提醒时间到！**\n📌 事项：{clean_content}"}},
             {"tag": "hr"},
             {"tag": "note", "elements": [{"tag": "lark_md",
                                           "content": f"💡 生成于北京时间: {(datetime.utcnow() + timedelta(hours=8)).strftime('%H:%M')}"}]}
@@ -77,7 +78,7 @@ def send_reminder_card(chat_id, content, is_daily=False):
     if not resp.success():
         print(f"❌ 推送失败: {resp.msg}")
     else:
-        print(f"✅ 成功推送事项: {content}")
+        print(f"✅ 成功推送事项: {clean_content}")
 
 
 # --- 4. 任务扫描线程 (GitHub Actions 防漏逻辑) ---
@@ -138,18 +139,19 @@ def process_message_async(data: P2ImMessageReceiveV1):
     now_bj = datetime.utcnow() + timedelta(hours=8)
 
     # 【核心优化 1】极其严厉的 Prompt
-    prompt = f"""你是助手Allen Agent。现在北京时间{now_bj.strftime('%Y-%m-%d %H:%M')}。
-        你的任务是帮助用户设定提醒。
+    prompt = f"""你是全能助手 Allen Agent。现在北京时间 {now_bj.strftime('%Y-%m-%d %H:%M')}。
 
-        规则：
-        1. 如果用户要求设定提醒，你必须在回答的【最后一行】精准附带指令。
-        2. 一次性指令格式：@@@TASK_ONCE:事项|HH:mm@@@
-        3. 每日指令格式：@@@TASK_DAILY:事项|HH:mm@@@
-        4. 不要缩写事项，不要更改 @@@ 符号。
+        能力要求：
+        1. 你可以像普通人一样聊天、回答问题、写代码、推荐电影等等。
+        2. **核心触发：** 当用户明确要求“提醒、定时、循环、记得”某事时，你必须在回答的【最后一行】附带专属指令。
+        3. 严禁修改指令格式：
+           一次性：@@@TASK_ONCE:事项|HH:mm@@@
+           每日：@@@TASK_DAILY:事项|HH:mm@@@
 
-        示例回复：
-        好的，没问题。
-        @@@TASK_ONCE:睡觉|23:43@@@
+        示例：
+        用户：推荐部科幻片，并提醒我今晚 10 点看。
+        你：推荐《星际穿越》。
+        @@@TASK_ONCE:看《星际穿越》|22:00@@@
         """
 
     res = ai_client.chat.completions.create(
