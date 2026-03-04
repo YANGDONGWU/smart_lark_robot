@@ -1,21 +1,12 @@
-import os
-import json
+import os, json, time
 import lark_oapi as lark
-# 1. 显式导入模型
-from lark_oapi.api.im.v1 import (
-    P2ImMessageReceiveV1,
-    ReplyMessageRequest,
-    ReplyMessageRequestBody
-)
-# 核心修正：导入模块中的 Client 类，并显式指定 EventDispatcher
-from lark_oapi.ws import Client as WsClient  # 注意这里是 ws_client 模块里的 Client 类
+from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageRequest, ReplyMessageRequestBody
+from lark_oapi.ws.client import Client as WsClient
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
 from openai import OpenAI
 from tavily import TavilyClient
 
-processed_messages = set()
-
-# 2. 全局配置
+# 1. 配置与全局缓存
 APP_ID = os.getenv("FEISHU_APP_ID")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
@@ -25,99 +16,103 @@ ai_client = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
 tavily_client = TavilyClient(api_key=TAVILY_KEY)
 lark_client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 
+# 消息去重与多轮对话缓存
+processed_msgs = set()
+session_history = {}  # {chat_id: [{"role": "user", "content": "..."}, ...]}
 
-def judge_need_search(query):
+
+def get_ai_answer(chat_id, user_query):
+    # --- A. 每一条消息都强制联网搜索 ---
+    print(f"--- 正在实时检索: {user_query} ---")
+    search_context = ""
     try:
-        check_res = ai_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "你是一个搜索判定器。如果用户询问：股市、股价、收盘、今天新闻、天气、或任何涉及 2024 年之后的事实，必须回答 'YES'。其余情况回答 'NO'。"},
-                {"role": "user", "content": query}
-            ],
-            max_tokens=5,
-            temperature=0
-        )
-        result = check_res.choices[0].message.content.upper()
-        return "YES" in result
-    except:
-        return True # 出错时默认开启搜索，保证用户体验
+        # 搜索最近 3 年的数据，确保覆盖莱希遇难等突发事件
+        search_res = tavily_client.search(query=user_query, search_depth="advanced", max_results=5)
+        search_context = "\n".join([f"资料{i + 1}: {r['content']}" for i, r in enumerate(search_res['results'])])
+    except Exception as e:
+        print(f"搜索插件异常: {e}")
 
-# 3. 核心功能
-def get_ai_answer(query):
-    if judge_need_search(query):
-        print(f"--- 正在实时联网搜索最新数据 ---")
-        try:
-            # 增加搜索深度
-            search_res = tavily_client.search(query=query, search_depth="advanced", max_results=5)
-            context = "\n".join([f"实时资讯: {r['content']}" for r in search_res['results']])
+    # --- B. 构造多轮对话上下文 ---
+    if chat_id not in session_history:
+        session_history[chat_id] = []
 
-            # 强力引导：消除模型的“自谦”幻觉
-            final_prompt = f"""
-                当前实时时间: 2026年3月
-                你现在拥有实时联网能力，以下是为你搜索到的最新实时资料：
-                ---
-                {context}
-                ---
-                请根据上述实时资料回答用户问题：{query}
-                注意：直接回答事实，严禁说“我无法联网”或“我的知识截止到某年”。
-                """
-        except Exception as e:
-            print(f"搜索发生异常: {e}")
-            final_prompt = query
-    else:
-        final_prompt = query
+    # 获取历史记录并限制长度（保留最近 6 条防止 Token 溢出）
+    history = session_history[chat_id][-6:]
 
+    # 构建当前任务的指令
+    system_prompt = f"""
+    你是飞书智能助手杨艾伦。当前实时时间：2026年3月4日。
+    你拥有实时联网能力，必须基于下方提供的【最新搜索资料】回答。
+
+    【核心事实校准】：
+    - 伊朗前总统莱希已于2024年5月坠机身亡。
+    - 现任伊朗总统是马蘇德·佩澤希齊揚（Masoud Pezeshkian）。
+
+    如果用户指代不明（如问“他被杀了吗”），请结合【上下文历史】进行判断。
+    """
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({
+        "role": "user",
+        "content": f"【最新搜索资料】：\n{search_context}\n\n【当前问题】：{user_query}"
+    })
+
+    # --- C. 调用 DeepSeek ---
     response = ai_client.chat.completions.create(
         model="deepseek-chat",
-        messages=[{"role": "user", "content": final_prompt}]
+        messages=messages,
+        temperature=0.3
     )
-    return response.choices[0].message.content
+    answer = response.choices[0].message.content
 
-# 4. 消息回调处理
+    # 存入历史（不存搜索资料，只存对话）
+    session_history[chat_id].append({"role": "user", "content": user_query})
+    session_history[chat_id].append({"role": "assistant", "content": answer})
+
+    return answer
+
 
 def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
     msg_id = data.event.message.message_id
+    chat_id = data.event.message.chat_id  # 用于区分不同人的对话
 
-    # --- 1. 去重邏輯 ---
-    if msg_id in processed_messages:
-        return  # 如果處理過，直接退出，不跑後面的 AI
-    processed_messages.add(msg_id)
+    # 1. 彻底解决重复回复：消息 ID 去重
+    if msg_id in processed_msgs: return
+    processed_msgs.add(msg_id)
+    if len(processed_msgs) > 500: processed_msgs.clear()
 
-    # 限制快取大小，防止內存溢出（保留最近 100 條即可）
-    if len(processed_messages) > 100:
-        processed_messages.pop()
+    # 2. 解析消息内容
     try:
-        # data.event.message.content 是转义后的字符串 JSON
         content_dict = json.loads(data.event.message.content)
-        user_query = content_dict.get("text", "")
+        user_query = content_dict.get("text", "").strip()
     except:
-        user_query = ""
-
-    if not user_query:
         return
 
-    print(f"Received: {user_query}")
-    answer = get_ai_answer(user_query)
+    if not user_query: return
 
-    # 5. 回复消息
+    # 3. 获取 AI 回答（带上下文）
+    answer = get_ai_answer(chat_id, user_query)
+
+    # 4. 回复飞书
     reply_req = ReplyMessageRequest.builder() \
-        .message_id(data.event.message.message_id) \
+        .message_id(msg_id) \
         .request_body(ReplyMessageRequestBody.builder()
                       .content(json.dumps({"text": answer}))
                       .msg_type("text")
                       .build()) \
         .build()
-
     lark_client.im.v1.message.reply(reply_req)
 
-# 6. 核心修正：使用 EventDispatcher 而非 Handler
+
+# --- 事件注册与启动 ---
 event_handler = EventDispatcherHandler.builder("", "") \
     .register_p2_im_message_receive_v1(do_p2_im_message_receive_v1) \
     .build()
 
+
 def main():
-    print("Bot is starting with lark-oapi 1.5.3...")
-    # 7. 实例化 WsClient 类
+    print("杨艾伦已切换至【全量联网+多轮记忆】模式，监听中...")
     ws_client = WsClient(
         app_id=APP_ID,
         app_secret=APP_SECRET,
@@ -125,6 +120,7 @@ def main():
         log_level=lark.LogLevel.INFO
     )
     ws_client.start()
+
 
 if __name__ == "__main__":
     main()
