@@ -12,7 +12,7 @@ APP_ID = os.getenv("FEISHU_APP_ID")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET")
 DEEPSEEK_KEY = os.getenv("DEEPSEEK_KEY")
 REDIS_URL = "https://together-reindeer-4127.upstash.io"
-REDIS_TOKEN = os.getenv("FEISHU_REDIS_TOKEN")
+REDIS_TOKEN = "ARAfAAImcDI2N2I1NDdkMjBkYTE0OWM3YmNjYzg1YWNhMjUxOWE2YXAyNDEyNw"
 
 # 客户端初始化
 ai_client = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com")
